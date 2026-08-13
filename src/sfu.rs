@@ -86,9 +86,15 @@ impl Protocol<TaggedBytesMut, Infallible, SFUEvent> for Sfu {
             let mut remove_room = false;
             if let Some(room) = self.rooms.get_mut(&room_id) {
                 let is_leave_event = matches!(evt, SFUEvent::Leave { .. });
+                let leaving_client_id = evt.client_id();
                 room.handle_event(evt)?;
-                if is_leave_event && room.is_empty() {
-                    remove_room = true;
+                if is_leave_event {
+                    if let Some(client_id) = leaving_client_id {
+                        self.demuxer.evict(room_id, client_id);
+                    }
+                    if room.is_empty() {
+                        remove_room = true;
+                    }
                 }
             } else if let SFUEvent::Join { .. } = &evt {
                 let mut room = Room::new(room_id, self.local_addr);
@@ -302,6 +308,35 @@ mod tests {
         let room = sfu.rooms.get(&ROOM).expect("room should exist after join");
         assert_eq!(room.id(), ROOM);
         assert!(!room.is_empty(), "room should contain the joined client");
+    }
+
+    #[test]
+    fn join_beyond_room_cap_is_rejected_and_room_size_does_not_grow() {
+        use crate::room::MAX_ROOM_PARTICIPANTS;
+
+        let mut sfu = Sfu::new(0, "0.0.0.0:0".parse().unwrap());
+
+        for client_id in 0..MAX_ROOM_PARTICIPANTS as crate::ClientId {
+            join_client(&mut sfu, client_id as RequestId, client_id);
+        }
+        {
+            let room = sfu.rooms.get(&ROOM).expect("room should exist");
+            assert_eq!(room.id(), ROOM);
+        }
+
+        let overflow_client: crate::ClientId = MAX_ROOM_PARTICIPANTS as crate::ClientId;
+        let overflow_request_id: RequestId = 9999;
+        join_client(&mut sfu, overflow_request_id, overflow_client);
+
+        let events = drain_events(&mut sfu);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                SFUEvent::Err { request_id, client_id: Some(c), .. }
+                    if *request_id == overflow_request_id && *c == overflow_client
+            )),
+            "the room-full join should surface an Err event, got {events:?}"
+        );
     }
 
     #[test]

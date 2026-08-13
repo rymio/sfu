@@ -34,6 +34,13 @@ use uuid::Uuid;
 /// rendering that is legal inside an ICE ufrag (see [`Room::build_client`]).
 pub type RoomId = Uuid;
 
+/// Interim safety cap on room size — prevents unbounded growth from a misbehaving or
+/// malicious signaling client, not a product decision about maximum group-call size.
+/// Revisit (likely making this configurable) once real group-call capacity planning
+/// happens; for now a fixed constant is enough to close the "anyone can join forever"
+/// gap without adding config surface nothing consumes yet.
+pub(crate) const MAX_ROOM_PARTICIPANTS: usize = 16;
+
 /// Render a room id as the string that appears as base64, unpadded.
 fn encode_room_id(room_id: &RoomId) -> String {
     STANDARD_NO_PAD.encode(room_id.as_bytes())
@@ -589,14 +596,26 @@ impl Protocol<TaggedBytesMut, Infallible, SFUEvent> for Room {
                     client.close()?;
                     remove_client = true;
                     needs_reconcile = true;
+                    self.demuxer.evict(room_id, client_id);
                 } else {
                     needs_reconcile = matches!(evt, SFUEvent::SessionDescription { .. });
                     client.handle_event(ClientEvent::SFUEvent(evt))?;
                 }
             } else if let SFUEvent::Join { .. } = &evt {
-                let client = self.build_client(client_id, room_id)?;
-                self.clients.insert(client_id, client);
-                needs_reconcile = false;
+                if self.clients.len() >= MAX_ROOM_PARTICIPANTS {
+                    self.events.push_back(SFUEvent::Err {
+                        request_id: evt.request_id(),
+                        room_id: Some(room_id),
+                        client_id: Some(client_id),
+                        reason: format!(
+                            "room {room_id} is full (max {MAX_ROOM_PARTICIPANTS} participants)"
+                        ),
+                    });
+                } else {
+                    let client = self.build_client(client_id, room_id)?;
+                    self.clients.insert(client_id, client);
+                    needs_reconcile = false;
+                }
             }
 
             if remove_client {

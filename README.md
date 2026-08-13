@@ -80,7 +80,10 @@ Sfu   ── owns rooms: HashMap<RoomId, Room>, a Demuxer, the local_addr, trans
 - **`Demuxer`** ([`src/demuxer.rs`](src/demuxer.rs)) maps an incoming datagram to a
   `(RoomId, ClientId)`: by learned 4-tuple affinity once media flows, and otherwise by
   parsing the STUN `USERNAME` local-ufrag during ICE. Both `Sfu` and `Room` hold one —
-  `Sfu` demuxes to the room, `Room` demuxes to the client.
+  `Sfu` demuxes to the room, `Room` demuxes to the client. `Demuxer::evict` forgets every
+  four-tuple learned for a client on `Leave` — reactive, not time-based (the sans-IO core
+  has no clock of its own), so it relies on the caller actually delivering `Leave`, which
+  `examples/signaling` always does on WebSocket close, graceful or not.
 
   A `RoomId` is a `Uuid`, which the ufrag has to carry as text. `room::encode_local_ufrag`
   and `room::decode_local_ufrag` are the matched pair that does it, formatting
@@ -115,8 +118,10 @@ For example, an `SFUEvent::Join` creates the `Room` and the `Client` (default me
   the client (`set_remote_description` → add the `local_addr` host candidate → `create_answer`
   → `set_local_description`) and the resulting **answer** is emitted back out through
   `poll_event`, while publishing a track prompts server-initiated subscribe re-offers to the
-  other clients; an `SFUEvent::Leave` tears the client down, prunes its forwarding entries, and
-  reaps the room once empty.
+  other clients; an `SFUEvent::Leave` tears the client down, prunes its forwarding entries and
+  `Demuxer` affinity, and reaps the room once empty. A room rejects joins past
+  `room::MAX_ROOM_PARTICIPANTS` (currently 16 — an interim safety cap against unbounded
+  growth, not a product decision) with an `SFUEvent::Err`.
 
 ## Building
 
@@ -154,6 +159,23 @@ Then open the printed URL in a browser (it serves `examples/chat.html`). Useful 
 `--media-port-min`/`--media-port-max` (default `3478`–`3495`),
 `-f`/`--force-local-loop`, `--debug`, and `--level <error|warn|info|debug|trace>`.
 
+**Auth and TURN credential issuance are both opt-in**, off by default so the flow above and
+`tests/` (which never send a token) keep working unmodified:
+
+- `--join-secret` / `SFU_JOIN_SECRET` — when set, `register` requires an HMAC-signed,
+  room+client-bound token (`examples/signaling/security.rs`). Mint one for manual testing
+  with the bundled `mint_token` example:
+  ```bash
+  cargo run --example mint_token -- --secret "$SFU_JOIN_SECRET" --room <uuid> --client <id>
+  ```
+- `--turn-secret` / `SFU_TURN_SECRET` — when set, a successful `register` gets short-lived
+  TURN REST API credentials back (`--turn-uris`, `--turn-credential-ttl`). The SFU itself
+  never needs TURN for its own connectivity (it's ICE-lite — see below), this is purely for
+  handing the *client* something to configure its own `RTCPeerConnection({iceServers})` with.
+
+Leaving either unset prints a startup warning; see [`DEPLOY.md`](DEPLOY.md) for deploying
+this to a public host with both configured.
+
 ### Integration tests
 
 `tests/` drives the SFU end-to-end: each test is a headless WebRTC client (built on the
@@ -186,9 +208,14 @@ it boots the `chat` server and the tests together and collects `logs/sfu.log` + 
   the `chat` example carries its own TLS-WebSocket signaling in `examples/signaling/`.
 - The architecture is fully operational end-to-end: signaling (join → offer/answer,
   server-initiated subscribe re-offers), datagram routing (`handle_read` demux → PC,
-  `poll_write` drain), RTP fan-out via `ForwardTable`, and RTCP keyframe (PLI/FIR) relay from
-  subscribers back to publishers. Remaining work includes refining `Demuxer` affinity expiry
-  and eviction policies.
+  `poll_write` drain), RTP fan-out via `ForwardTable`, RTCP keyframe (PLI/FIR) relay from
+  subscribers back to publishers, `Demuxer` affinity eviction on `Leave`, a per-room
+  participant cap, and opt-in `register` auth + TURN credential issuance in
+  `examples/signaling`. Auth is a shared-secret grant ("someone who holds the secret
+  authorized this room/client pair"), not an identity system — binding it to a real
+  account is downstream application work, out of scope for this crate.
+- Deploying the `chat` example to a real host (systemd unit, certs, firewall) is covered in
+  [`DEPLOY.md`](DEPLOY.md), not repeated here.
 
 ## Open Source License
 

@@ -65,10 +65,48 @@ struct Cli {
     output_log_file: String,
     #[arg(long, default_value_t = format!(""))]
     web_root: String,
+
+    /// Shared secret `register` join tokens must be signed with (mint one with the
+    /// `mint_token` example) — see `security::verify_join_token`. Optional: with no secret
+    /// configured, `register` accepts any room/client with no token check at all, matching
+    /// this crate's original behavior (and what `tests/` relies on) — see this file's
+    /// startup warning for why that's a real tradeoff, not a free default.
+    #[arg(long, env = "SFU_JOIN_SECRET")]
+    join_secret: Option<String>,
+    /// Shared secret matching a TURN server's `static-auth-secret` (e.g. `turn1.sigs.au`'s
+    /// coturn config) — used only to *issue* credentials to clients over signaling; the
+    /// SFU's own ICE-lite connectivity never uses TURN itself. Optional: with none
+    /// configured, no TURN credentials are issued to clients at all.
+    #[arg(long, env = "SFU_TURN_SECRET")]
+    turn_secret: Option<String>,
+    /// Comma-separated TURN/STUN URIs handed to clients alongside issued credentials.
+    #[arg(
+        long,
+        env = "SFU_TURN_URIS",
+        default_value = "turn:turn1.sigs.au:3478,turns:turn1.sigs.au:443?transport=tcp,stun:turn1.sigs.au:3478"
+    )]
+    turn_uris: String,
+    /// TURN credential TTL in seconds.
+    #[arg(long, default_value_t = 3600)]
+    turn_credential_ttl: u64,
 }
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if cli.join_secret.is_none() {
+        eprintln!(
+            "WARNING: --join-secret / SFU_JOIN_SECRET not set — register is UNAUTHENTICATED, \
+             anyone who reaches this port can join any room. Fine for local/CI testing, \
+             do not run a public deployment like this."
+        );
+    }
+    if cli.turn_secret.is_none() {
+        eprintln!(
+            "WARNING: --turn-secret / SFU_TURN_SECRET not set — no TURN credentials will be \
+             issued; clients that can't reach this host directly (restrictive NAT/firewall) \
+             won't be able to connect."
+        );
+    }
     if cli.debug {
         env_logger::Builder::new()
             .target(if !cli.output_log_file.is_empty() {
@@ -170,6 +208,18 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|e| panic!("binding signaling port {signal_port}: {e}"));
     println!("Connect a browser to https://{}:{}", host_addr, signal_port);
 
+    let security = Arc::new(signaling::security::SignalingSecurity {
+        join_secret: cli.join_secret,
+        turn_secret: cli.turn_secret,
+        turn_uris: cli
+            .turn_uris
+            .split(',')
+            .map(str::to_owned)
+            .filter(|s| !s.is_empty())
+            .collect(),
+        turn_credential_ttl: cli.turn_credential_ttl,
+    });
+
     let signal_handle = {
         let stop_rx = stop_rx.clone();
         let media_port_thread_map = media_port_thread_map.clone();
@@ -186,6 +236,7 @@ fn main() -> anyhow::Result<()> {
                 tls_config,
                 media_port_thread_map,
                 web_root,
+                security,
             );
         })
     };

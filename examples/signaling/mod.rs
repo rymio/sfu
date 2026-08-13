@@ -11,6 +11,8 @@
 //! We own the TCP + TLS listener directly (no rouille): a small hand-rolled HTTP layer
 //! serves `GET /` (the page) and upgrades `/ws` to a `tungstenite` WebSocket.
 
+pub mod security;
+
 use bytes::BytesMut;
 use log::{error, info, trace, warn};
 use rand::random;
@@ -18,6 +20,7 @@ use rtc::peer_connection::sdp::{RTCSdpType, RTCSessionDescription};
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use sansio::Protocol;
+use security::SignalingSecurity;
 use sfu::{ClientId, RequestId, RoomId, SFUEvent, Sfu};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
@@ -47,10 +50,10 @@ pub enum Command {
 }
 
 /// JSON envelope the browser sends over the WebSocket (AppRTC/Collider style):
-/// `{cmd:"register", roomid, clientid}` once, then `{cmd:"offer"|"answer", sdp,
+/// `{cmd:"register", roomid, clientid, token}` once, then `{cmd:"offer"|"answer", sdp,
 /// request_id?}` or `{cmd:"leave"}`. `request_id` is required only when answering an
 /// SFU-initiated re-offer so the SFU can correlate that answer to its outstanding
-/// transaction.
+/// transaction. `token` is required on `register` — see [`security::verify_join_token`].
 #[derive(serde::Deserialize)]
 struct WsClientMsg {
     cmd: String,
@@ -62,6 +65,8 @@ struct WsClientMsg {
     sdp: Option<RTCSessionDescription>,
     #[serde(default)]
     request_id: Option<RequestId>,
+    #[serde(default)]
+    token: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -70,6 +75,27 @@ struct WsServerSdp<'a> {
     sdp: &'a RTCSessionDescription,
     #[serde(skip_serializing_if = "Option::is_none")]
     request_id: Option<RequestId>,
+}
+
+/// Sent instead of proceeding with `register` when the token is missing, malformed,
+/// expired, or doesn't authorize this `(roomid, clientid)` pair. Distinguishable from
+/// `WsServerSdp`/`WsServerRegistered` by browsers that only check for a `type` field
+/// (`chat.html`'s `onWsMessage` falls through to its `else` branch and logs it — this
+/// intentionally has no `type: "answer"`/`"offer"` value, so it can never be mistaken for
+/// an SDP message there).
+#[derive(serde::Serialize)]
+struct WsServerError<'a> {
+    error: &'a str,
+}
+
+/// Sent once `register` succeeds, before any SDP exchange — gives the browser the TURN
+/// credentials it needs to configure its own `RTCPeerConnection({iceServers})` before it
+/// creates its offer. See [`security::generate_turn_credentials`] for why the SFU itself
+/// never needs these.
+#[derive(serde::Serialize)]
+struct WsServerRegistered<'a> {
+    registered: bool,
+    turn: &'a security::TurnCredentials,
 }
 
 /// What a WebSocket binds to once it has `register`ed: its room/client and the run loop
@@ -89,6 +115,7 @@ pub fn serve(
     tls_config: Arc<ServerConfig>,
     media_port_thread_map: Arc<HashMap<u16, SyncSender<Command>>>,
     web_root: Arc<Option<String>>,
+    security: Arc<SignalingSecurity>,
 ) {
     listener
         .set_nonblocking(true)
@@ -107,10 +134,15 @@ pub fn serve(
                 let tls_config = tls_config.clone();
                 let media_port_thread_map = media_port_thread_map.clone();
                 let web_root = web_root.clone();
+                let security = security.clone();
                 std::thread::spawn(move || {
-                    if let Err(err) =
-                        handle_connection(tcp, tls_config, &media_port_thread_map, &web_root)
-                    {
+                    if let Err(err) = handle_connection(
+                        tcp,
+                        tls_config,
+                        &media_port_thread_map,
+                        &web_root,
+                        &security,
+                    ) {
                         trace!("connection ended: {}", err);
                     }
                 });
@@ -131,6 +163,7 @@ fn handle_connection(
     tls_config: Arc<ServerConfig>,
     media_port_thread_map: &HashMap<u16, SyncSender<Command>>,
     web_root: &Option<String>,
+    security: &Arc<SignalingSecurity>,
 ) -> anyhow::Result<()> {
     // The accepted stream can inherit the listener's non-blocking flag; the TLS handshake
     // and request-head read need blocking I/O (the per-frame read timeout is set later,
@@ -163,7 +196,7 @@ fn handle_connection(
 
         tls.sock.set_read_timeout(Some(WS_READ_TIMEOUT))?;
         let ws = WebSocket::from_raw_socket(tls, Role::Server, None);
-        ws_session(ws, media_port_thread_map);
+        ws_session(ws, media_port_thread_map, security);
     } else {
         serve_static(&mut tls, &request.path, web_root)?;
     }
@@ -256,7 +289,11 @@ fn serve_static(tls: &mut Tls, path: &str, web_root: &Option<String>) -> anyhow:
 
 /// Drive one client's WebSocket for its lifetime: read client frames → run loop, and
 /// drain server→browser pushes → client.
-fn ws_session(mut ws: WebSocket<Tls>, media_port_thread_map: &HashMap<u16, SyncSender<Command>>) {
+fn ws_session(
+    mut ws: WebSocket<Tls>,
+    media_port_thread_map: &HashMap<u16, SyncSender<Command>>,
+    security: &SignalingSecurity,
+) {
     // Server→browser channel; its sender is handed to the run loop on `register`.
     let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(64);
     let mut bound: Option<Bound> = None;
@@ -264,9 +301,13 @@ fn ws_session(mut ws: WebSocket<Tls>, media_port_thread_map: &HashMap<u16, SyncS
     loop {
         // 1. Read one client frame (blocks up to WS_READ_TIMEOUT).
         match ws.read() {
-            Ok(Message::Text(text)) => {
-                handle_ws_text(text.as_str(), &mut bound, &out_tx, media_port_thread_map)
-            }
+            Ok(Message::Text(text)) => handle_ws_text(
+                text.as_str(),
+                &mut bound,
+                &out_tx,
+                media_port_thread_map,
+                security,
+            ),
             Ok(Message::Ping(payload)) => {
                 let _ = ws.send(Message::Pong(payload));
             }
@@ -313,6 +354,7 @@ fn handle_ws_text(
     bound: &mut Option<Bound>,
     out_tx: &SyncSender<String>,
     media_port_thread_map: &HashMap<u16, SyncSender<Command>>,
+    security: &SignalingSecurity,
 ) {
     let msg: WsClientMsg = match serde_json::from_str(text) {
         Ok(msg) => msg,
@@ -332,8 +374,28 @@ fn handle_ws_text(
                 warn!("duplicate register for {}/{}", room_id, client_id);
                 return;
             }
+            // Auth is opt-in: with no --join-secret configured, register behaves exactly
+            // as it always did (no token required) — see `SignalingSecurity`'s doc comment
+            // for why, and `chat.rs`'s startup warning for the production-safety side of
+            // that tradeoff.
+            if let Some(join_secret) = &security.join_secret {
+                let Some(token) = msg.token.as_deref() else {
+                    warn!("register missing token for {}/{}", room_id, client_id);
+                    send_error(out_tx, "missing token");
+                    return;
+                };
+                if !security::verify_join_token(join_secret, room_id, client_id, token) {
+                    warn!(
+                        "register rejected: invalid token for {}/{}",
+                        room_id, client_id
+                    );
+                    send_error(out_tx, "invalid or expired token");
+                    return;
+                }
+            }
             let Some(tx) = port_tx_for_room(media_port_thread_map, room_id) else {
                 warn!("no media port for room {}", room_id);
+                send_error(out_tx, "no media port available");
                 return;
             };
             info!(
@@ -352,9 +414,25 @@ fn handle_ws_text(
                     "run loop unavailable for register {}/{}",
                     room_id, client_id
                 );
+                send_error(out_tx, "server unavailable");
                 return;
             }
             *bound = Some((room_id, client_id, tx));
+
+            if let Some(turn_secret) = &security.turn_secret {
+                let turn = security::generate_turn_credentials(
+                    turn_secret,
+                    security.turn_credential_ttl,
+                    &security.turn_uris,
+                );
+                send_json(
+                    out_tx,
+                    &WsServerRegistered {
+                        registered: true,
+                        turn: &turn,
+                    },
+                );
+            }
         }
         "offer" | "answer" => {
             let Some((room_id, client_id, tx)) = bound.as_ref() else {
@@ -630,6 +708,25 @@ fn push_to_subscriber(
             room_id, client_id, err
         ),
     }
+}
+
+/// Serialize `payload` and push it to this client's own WebSocket writer. Used for
+/// register-time responses (`WsServerRegistered`/`WsServerError`), which — unlike
+/// `push_to_subscriber` — are always addressed to the socket that's asking, before any
+/// `(room_id, client_id)` binding exists in the shared `subscribers` map.
+fn send_json<T: serde::Serialize>(out_tx: &SyncSender<String>, payload: &T) {
+    match serde_json::to_string(payload) {
+        Ok(payload) => {
+            if out_tx.try_send(payload).is_err() {
+                warn!("WebSocket writer gone/full; dropping register-time response");
+            }
+        }
+        Err(err) => error!("failed to serialize register-time response: {}", err),
+    }
+}
+
+fn send_error(out_tx: &SyncSender<String>, reason: &str) {
+    send_json(out_tx, &WsServerError { error: reason });
 }
 
 // ───────────────────────────────────── logging ─────────────────────────────────────

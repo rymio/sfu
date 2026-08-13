@@ -23,7 +23,7 @@ uuid = { version = "1", features = ["serde"] }
 [dev-dependencies]
 webrtc = { version = "0.20.0", path = "webrtc" }
 
-clap = { version = "4.6.1", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive", "env"] }
 env_logger = "0.11.11"
 chrono = "0.4.45"
 anyhow = "1.0.103"
@@ -40,7 +40,13 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 async-trait = "0.1"
+hmac = "0.12"
+sha1 = "0.10"
 
 [[example]]
 name = "chat"
 path = "examples/chat.rs"
+
+[[example]]
+name = "mint_token"
+path = "examples/mint_token.rs"
