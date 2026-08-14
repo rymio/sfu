@@ -75,6 +75,13 @@ struct WsServerSdp<'a> {
     sdp: &'a RTCSessionDescription,
     #[serde(skip_serializing_if = "Option::is_none")]
     request_id: Option<RequestId>,
+    /// For a server-initiated subscribe offer only: maps each new/existing forwarding
+    /// m-line's `mid` (as it appears in *this* sdp) to the `ClientId` of the publisher it
+    /// forwards — see `SFUEvent::SessionDescription`'s `mid_publishers` doc comment in the
+    /// `sfu` crate for why this can't be inferred client-side from the SDP alone. Absent
+    /// (not an empty object) for answers and anything else that doesn't need it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mid_publishers: Option<HashMap<String, ClientId>>,
 }
 
 /// Sent instead of proceeding with `register` when the token is missing, malformed,
@@ -456,6 +463,8 @@ fn handle_ws_text(
                 room_id: *room_id,
                 client_id: *client_id,
                 sdp,
+                // Inbound (browser-sent) — irrelevant here, see the field's doc comment.
+                mid_publishers: Default::default(),
             }));
         }
         "leave" => {
@@ -658,6 +667,7 @@ fn drain_sfu_events(
                 room_id,
                 client_id,
                 sdp,
+                mid_publishers,
             } => {
                 let label = if sdp.sdp_type == RTCSdpType::Answer {
                     "Answer"
@@ -671,6 +681,7 @@ fn drain_sfu_events(
                     client_id,
                     &sdp,
                     (sdp.sdp_type == RTCSdpType::Offer).then_some(request_id),
+                    mid_publishers,
                 );
             }
             other => warn!("run loop dropped unroutable SFU event {:?}", other),
@@ -684,6 +695,7 @@ fn push_to_subscriber(
     client_id: ClientId,
     sdp: &RTCSessionDescription,
     request_id: Option<RequestId>,
+    mid_publishers: HashMap<String, ClientId>,
 ) {
     let key = (room_id, client_id);
     let Some(tx) = subscribers.get(&key) else {
@@ -693,7 +705,16 @@ fn push_to_subscriber(
         );
         return;
     };
-    match serde_json::to_string(&WsServerSdp { sdp, request_id }) {
+    let payload = WsServerSdp {
+        sdp,
+        request_id,
+        mid_publishers: if mid_publishers.is_empty() {
+            None
+        } else {
+            Some(mid_publishers)
+        },
+    };
+    match serde_json::to_string(&payload) {
         Ok(payload) => {
             if tx.try_send(payload).is_err() {
                 warn!(

@@ -1,7 +1,9 @@
+use std::collections::HashMap;
+
 use rtc::peer_connection::sdp::RTCSessionDescription;
 use rtc::peer_connection::transport::RTCIceCandidateInit;
 
-use crate::client::ClientId;
+use crate::client::{ClientId, Mid};
 use crate::room::RoomId;
 
 pub type RequestId = u64;
@@ -30,6 +32,17 @@ pub enum SFUEvent {
         room_id: RoomId,
         client_id: ClientId,
         sdp: RTCSessionDescription,
+        /// For a server-initiated subscribe offer (`sdp.sdp_type ==
+        /// Offer`), maps each new/existing forwarding m-line's `mid` (as
+        /// it appears in *this* `sdp`, not the original publisher's own
+        /// mid — each subscriber's peer connection numbers its own mids
+        /// independently) to the `ClientId` of the publisher it forwards.
+        /// Empty for every other case (answers to a client's own offer,
+        /// and any inbound client-sent offer/answer) — there is no
+        /// ambiguity to resolve there. Populated by `Room::poll_event`,
+        /// which is the only place with both a subscriber's own mid
+        /// assignments and the room's `ForwardTable` in scope at once.
+        mid_publishers: HashMap<Mid, ClientId>,
     },
     IceCandidate {
         request_id: RequestId,

@@ -72,6 +72,22 @@ impl ForwardTable {
         Some((key, subscribers))
     }
 
+    /// Every `(publisher, sender_id)` pair `subscriber` currently has a forwarding sender
+    /// for — i.e. everything it's subscribed to, from whichever publisher, regardless of
+    /// mid. Used to build the mid→publisher map attached to a subscriber's outbound offer
+    /// (`Room::poll_event`) — `sender_id` is resolved to *that offer's* actual mid
+    /// separately, since a subscriber's mid numbering is its own and unrelated to the
+    /// publisher's.
+    pub(crate) fn senders_for_subscriber(
+        &self,
+        subscriber: ClientId,
+    ) -> impl Iterator<Item = (ClientId, RTCRtpSenderId)> + '_ {
+        self.entries.iter().filter_map(move |(key, subs)| {
+            subs.get(&subscriber)
+                .map(|&sender_id| (key.publisher, sender_id))
+        })
+    }
+
     /// Drop forwardings that are no longer wanted and collect their senders so the caller
     /// can `remove_track` them from the subscriber peer connections:
     ///   - the `(publisher, mid)` is no longer published (not in `desired`), or
@@ -166,5 +182,28 @@ mod tests {
         assert_eq!(removed, vec![(2, RTCRtpSenderId::from(7))]);
         assert!(table.route_by_ssrc(1111).is_none());
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn senders_for_subscriber_covers_every_publisher_it_forwards() {
+        let mut table = ForwardTable::default();
+        // Subscriber 3 has forwarding senders from two different publishers.
+        table.insert(key(1, "0"), 3, RTCRtpSenderId::from(10));
+        table.insert(key(2, "0"), 3, RTCRtpSenderId::from(11));
+        // Subscriber 4's own sender must not leak into subscriber 3's results.
+        table.insert(key(1, "0"), 4, RTCRtpSenderId::from(12));
+
+        let got: Vec<_> = table.senders_for_subscriber(3).collect();
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&(1, RTCRtpSenderId::from(10))));
+        assert!(got.contains(&(2, RTCRtpSenderId::from(11))));
+    }
+
+    #[test]
+    fn senders_for_subscriber_empty_when_nothing_forwarded_to_it() {
+        let mut table = ForwardTable::default();
+        table.insert(key(1, "0"), 3, RTCRtpSenderId::from(10));
+
+        assert_eq!(table.senders_for_subscriber(99).count(), 0);
     }
 }

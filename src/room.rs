@@ -14,6 +14,7 @@ use rtc::peer_connection::configuration::media_engine::MediaEngine;
 use rtc::peer_connection::configuration::setting_engine::SettingEngine;
 use rtc::peer_connection::event::{RTCPeerConnectionEvent, RTCTrackEvent};
 use rtc::peer_connection::message::RTCMessage;
+use rtc::peer_connection::sdp::RTCSdpType;
 use rtc::peer_connection::transport::RTCDtlsRole;
 use rtc::rtcp::Packet;
 use rtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
@@ -641,6 +642,34 @@ impl Protocol<TaggedBytesMut, Infallible, SFUEvent> for Room {
         for (client_id, client) in &mut self.clients {
             while let Some(event) = client.poll_event() {
                 match event {
+                    ClientEvent::SFUEvent(SFUEvent::SessionDescription {
+                        request_id,
+                        room_id,
+                        client_id: subscriber_id,
+                        sdp,
+                        mid_publishers: _,
+                    }) if sdp.sdp_type == RTCSdpType::Offer => {
+                        // Server-initiated subscribe offer: attach which publisher each
+                        // forwarding mid in *this* sdp belongs to (see the field's doc
+                        // comment on why this can only be resolved here — Client alone
+                        // has no visibility into Room's ForwardTable).
+                        let mid_publishers = self
+                            .forward
+                            .senders_for_subscriber(subscriber_id)
+                            .filter_map(|(publisher, sender_id)| {
+                                client
+                                    .transceiver_mid(sender_id)
+                                    .map(|mid| (mid, publisher))
+                            })
+                            .collect();
+                        self.events.push_back(SFUEvent::SessionDescription {
+                            request_id,
+                            room_id,
+                            client_id: subscriber_id,
+                            sdp,
+                            mid_publishers,
+                        });
+                    }
                     ClientEvent::SFUEvent(evt) => {
                         self.events.push_back(evt);
                     }

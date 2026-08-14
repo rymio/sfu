@@ -649,6 +649,9 @@ impl Client {
                 room_id: self.room_id,
                 client_id: self.id,
                 sdp,
+                // Client has no visibility into Room's ForwardTable — Room::poll_event
+                // fills this in for real when relaying an outbound offer.
+                mid_publishers: Default::default(),
             }));
         Ok(())
     }
@@ -710,6 +713,9 @@ impl Client {
                     room_id: self.room_id,
                     client_id: self.id,
                     sdp: sdp_answer,
+                    // This is an answer to the client's own offer — no ambiguity to
+                    // resolve, so nothing to populate (see the field's doc comment).
+                    mid_publishers: Default::default(),
                 }));
 
             // The client's first offer is now answered: the initial SDP round is complete and the
@@ -770,6 +776,8 @@ impl Client {
                 room_id,
                 client_id,
                 sdp,
+                // Irrelevant for inbound processing — see the field's doc comment.
+                mid_publishers: _,
             } => {
                 trace!(
                     "{}:[{}/{}] receives SDP {}:\n{}",

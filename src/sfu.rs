@@ -226,6 +226,7 @@ mod tests {
             room_id: ROOM,
             client_id,
             sdp: build_bootstrap_offer(),
+            mid_publishers: Default::default(),
         })
         .expect("client bootstrap offer should be handled");
         drain_events(sfu);
@@ -371,6 +372,7 @@ mod tests {
             room_id: ROOM,
             client_id: CLIENT,
             sdp: build_offer(),
+            mid_publishers: Default::default(),
         })
         .expect("handling the offer should succeed");
 
@@ -384,6 +386,7 @@ mod tests {
                 room_id,
                 client_id,
                 sdp,
+                mid_publishers: _,
             } => {
                 assert_eq!(got_request_id, request_id);
                 assert_eq!(room_id, ROOM);
@@ -422,6 +425,7 @@ mod tests {
             room_id: ROOM,
             client_id: CLIENT,
             sdp: build_offer(),
+            mid_publishers: Default::default(),
         })
         .expect("handling the publisher offer should succeed");
 
@@ -465,6 +469,7 @@ mod tests {
             room_id: ROOM,
             client_id: CLIENT,
             sdp: build_offer(),
+            mid_publishers: Default::default(),
         })
         .expect("handling the publisher offer should succeed");
 
@@ -493,6 +498,71 @@ mod tests {
     }
 
     #[test]
+    fn subscribe_offer_attributes_its_new_mid_to_the_right_publisher() {
+        const SUBSCRIBER: crate::ClientId = 300;
+
+        let mut sfu = Sfu::new(0, "0.0.0.0:0".parse().unwrap());
+        join_client(&mut sfu, 1, CLIENT);
+        join_client(&mut sfu, 2, SUBSCRIBER);
+        negotiate_client(&mut sfu, 3, SUBSCRIBER);
+
+        sfu.handle_event(SFUEvent::SessionDescription {
+            request_id: 4,
+            room_id: ROOM,
+            client_id: CLIENT,
+            sdp: build_offer(),
+            mid_publishers: Default::default(),
+        })
+        .expect("handling the publisher offer should succeed");
+
+        let events = drain_events(&mut sfu);
+        let subscribe_offer = events
+            .iter()
+            .find_map(|e| match e {
+                SFUEvent::SessionDescription {
+                    client_id,
+                    sdp,
+                    mid_publishers,
+                    ..
+                } if *client_id == SUBSCRIBER && sdp.sdp_type == RTCSdpType::Offer => {
+                    Some((sdp, mid_publishers))
+                }
+                _ => None,
+            })
+            .expect("subscriber should receive a server-initiated offer");
+        let (sdp, mid_publishers) = subscribe_offer;
+
+        // CLIENT published exactly one track, so exactly one forwarding mid should be
+        // attributed — not zero (the map isn't just empty/unpopulated) and not more (no
+        // stale/phantom entries). The subscriber's *own* pre-existing bootstrap m-line
+        // (from `negotiate_client`'s data channel) is legitimately *not* a forwarding
+        // track and must not appear here, even though it's also present in this same SDP
+        // as a re-offer of the whole connection — this is what actually distinguishes
+        // "every mid in the map is real" from "the map happens to be non-empty".
+        assert_eq!(
+            mid_publishers.len(),
+            1,
+            "expected exactly one forwarding mid (one publisher, one track), got {mid_publishers:?}"
+        );
+        let (forwarded_mid, publisher) = mid_publishers.iter().next().unwrap();
+        assert_eq!(*publisher, CLIENT);
+
+        // And that mid must correspond to a real `a=mid:` line in the SDP this event
+        // actually carries — cross-checked against the real SDP text, not just trusted,
+        // so this fails if the map and the SDP ever drift apart.
+        let mids_in_sdp: Vec<&str> = sdp
+            .sdp
+            .lines()
+            .filter_map(|line| line.strip_prefix("a=mid:"))
+            .collect();
+        assert!(
+            mids_in_sdp.contains(&forwarded_mid.as_str()),
+            "mid {forwarded_mid} from mid_publishers should actually appear in the SDP, \
+             sdp mids were {mids_in_sdp:?}"
+        );
+    }
+
+    #[test]
     fn subscribe_offer_filters_unsupported_publisher_codecs() {
         const SUBSCRIBER: crate::ClientId = 300;
         const UNSUPPORTED_PT: u8 = 123;
@@ -509,6 +579,7 @@ mod tests {
             room_id: ROOM,
             client_id: CLIENT,
             sdp: build_offer_with_extra_video_codec(UNSUPPORTED_PT, "UNSUPPORTED"),
+            mid_publishers: Default::default(),
         })
         .expect("handling the publisher offer should succeed");
 
@@ -548,6 +619,7 @@ mod tests {
             room_id: ROOM,
             client_id: CLIENT,
             sdp: offer.clone(),
+            mid_publishers: Default::default(),
         })
         .expect("first publish should succeed");
         let first = drain_events(&mut sfu);
@@ -570,6 +642,7 @@ mod tests {
             room_id: ROOM,
             client_id: CLIENT,
             sdp: offer,
+            mid_publishers: Default::default(),
         })
         .expect("re-publish should succeed");
         let second = drain_events(&mut sfu);
@@ -602,6 +675,7 @@ mod tests {
             room_id: ROOM,
             client_id: CLIENT,
             sdp: build_offer(),
+            mid_publishers: Default::default(),
         })
         .expect("handling the publisher offer should succeed");
 
@@ -641,6 +715,7 @@ mod tests {
             room_id: ROOM,
             client_id: SUBSCRIBER,
             sdp: subscriber_offer,
+            mid_publishers: Default::default(),
         })
         .expect("handling subscriber bootstrap offer should succeed");
 
